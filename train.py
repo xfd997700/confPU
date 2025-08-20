@@ -56,7 +56,7 @@ def parse_args():
     p.add_argument("--self_adv_alpha", type=float, default=10.0)
     p.add_argument("--beta_fake", type=float, default=0.5)
     p.add_argument("--fm_gamma", type=float, default=0.5)
-    p.add_argument("--g_obj", type=str, default='linear', options=['linear', 'ns'])
+    p.add_argument("--g_obj", type=str, default='linear', choices=['linear', 'ns'])
 
     # ===== trainer =====
     # p.add_argument("--max_steps", type=int, default=10000)
