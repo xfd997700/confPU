@@ -174,11 +174,14 @@ class BucketManager:
         return torch.randint(low=start, high=end, size=(k,))
 
     # ---- in-BM splitter returning **ID-level** DataFrames ----
-    def split_ids(self, valid_size: float = 0.1, test_size: float = 0.1,
-                  min_bucket: int = 5, random_state: int = 42,
-                  ensure_entity_coverage: bool = True, verbose: bool = True):
+    def split_ids(self, valid_size: float = 0.1, test_size: float = 0.1, calib_size: float = 0.0,
+                min_bucket: int = 5, random_state: int = 42,
+                ensure_entity_coverage: bool = True, verbose: bool = True):
         """Stratified split by canonical relation id (r_id) with optional entity-coverage cleanup.
-        Returns: (train_ids, valid_ids, test_ids) with columns [h_id, r_id, t_id].
+        Returns:
+        - if calib_size <= 0: (train_ids, valid_ids, test_ids)
+        - else:               (train_ids, calib_ids, valid_ids, test_ids)
+        All DataFrames have columns [h_id, r_id, t_id].
         """
         t0 = time.time()
         if verbose: print('[split] start')
@@ -188,31 +191,72 @@ class BucketManager:
         # group row indices by r_id
         g = df.groupby('r_id', sort=False).indices  # dict[rid] -> ndarray of row idx
         rng = np.random.default_rng(random_state)
-        train_ix, valid_ix, test_ix = [], [], []
+        train_ix, valid_ix, test_ix, calib_ix = [], [], [], []
+        use_calib = calib_size is not None and calib_size > 0.0
+
         for rid, idx in g.items():
             idx = np.asarray(idx, dtype=np.int64)
             n = idx.size
             if n < min_bucket:
-                train_ix.append(idx); continue
+                # 小桶保持稳健：全部进 train
+                train_ix.append(idx)
+                continue
+
             rng.shuffle(idx)
-            n_test  = int(n * test_size)
-            n_valid = int(n * valid_size)
-            n_train = n - n_test - n_valid
-            if n_train <= 0:
-                n_train = 1; rem = n - 1
-                n_valid = int(rem * (valid_size / (valid_size + test_size + 1e-12)))
-                n_test  = rem - n_valid
-            train_ix.append(idx[:n_train])
-            valid_ix.append(idx[n_train:n_train+n_valid])
-            test_ix.append(idx[n_train+n_valid:])
+
+            if use_calib:
+                n_calib = int(n * calib_size)
+                n_test  = int(n * test_size)
+                n_valid = int(n * valid_size)
+                n_train = n - n_calib - n_test - n_valid
+                if n_train <= 0:
+                    # 至少留 1 个在 train，然后按比例分剩余
+                    n_train = 1
+                    rem = n - 1
+                    denom = (valid_size + test_size + calib_size) + 1e-12
+                    n_valid = int(rem * (valid_size / denom))
+                    n_test  = int(rem * (test_size  / denom))
+                    n_calib = rem - n_valid - n_test
+                p0 = 0
+                p1 = p0 + n_train
+                p2 = p1 + n_valid
+                p3 = p2 + n_test
+                p4 = p3 + n_calib
+                train_ix.append(idx[p0:p1])
+                valid_ix.append(idx[p1:p2])
+                test_ix.append(idx[p2:p3])
+                calib_ix.append(idx[p3:p4])
+            else:
+                n_test  = int(n * test_size)
+                n_valid = int(n * valid_size)
+                n_train = n - n_test - n_valid
+                if n_train <= 0:
+                    n_train = 1
+                    rem = n - 1
+                    n_valid = int(rem * (valid_size / (valid_size + test_size + 1e-12)))
+                    n_test  = rem - n_valid
+                train_ix.append(idx[:n_train])
+                valid_ix.append(idx[n_train:n_train+n_valid])
+                test_ix.append(idx[n_train+n_valid:])
+
+        # concat 索引
         cat = lambda parts: (np.concatenate(parts) if len(parts) else np.empty(0, dtype=np.int64))
         tri, vi, ti = cat(train_ix), cat(valid_ix), cat(test_ix)
         train = df.iloc[tri].copy(); valid = df.iloc[vi].copy(); test = df.iloc[ti].copy()
-        if verbose:
-            print(f"[stratify] train={len(train)} valid={len(valid)} test={len(test)} in {time.time()-t0:.2f}s")
+        if use_calib:
+            ci = cat(calib_ix)
+            calib = df.iloc[ci].copy()
+        else:
+            calib = pd.DataFrame(columns=df.columns).astype(df.dtypes.to_dict())  # 类型保持一致的空表
 
+        if verbose:
+            if use_calib:
+                print(f"[stratify] train={len(train)} valid={len(valid)} test={len(test)} calib={len(calib)} in {time.time()-t0:.2f}s")
+            else:
+                print(f"[stratify] train={len(train)} valid={len(valid)} test={len(test)} in {time.time()-t0:.2f}s")
+
+        # 覆盖清理：确保每个实体至少在 TRAIN 出现一次
         if ensure_entity_coverage:
-            # coverage cleanup: ensure every entity id appears in TRAIN at least once
             def cleanup_once(src: pd.DataFrame):
                 nonlocal train
                 if src.empty: return src, 0
@@ -226,15 +270,129 @@ class BucketManager:
                 train = pd.concat([train, move_rows], ignore_index=True)
                 kept = src.loc[~need]
                 return kept.reset_index(drop=True), int(need.sum())
+
             t1 = time.time()
-            valid, mv1 = cleanup_once(valid)
-            test,  mv2 = cleanup_once(test)
+            mv_calib = mv_valid = mv_test = 0
+            if use_calib:
+                calib, mv_calib = cleanup_once(calib)
+            valid, mv_valid = cleanup_once(valid)
+            test,  mv_test  = cleanup_once(test)
             if verbose:
-                print(f"[cleanup] moved={mv1+mv2} rows in {time.time()-t1:.2f}s")
+                if use_calib:
+                    print(f"[cleanup] moved={mv_calib+mv_valid+mv_test} rows (calib={mv_calib}, valid={mv_valid}, test={mv_test}) in {time.time()-t1:.2f}s")
+                else:
+                    print(f"[cleanup] moved={mv_valid+mv_test} rows (valid={mv_valid}, test={mv_test}) in {time.time()-t1:.2f}s")
 
         if verbose:
             print(f"[done] total={N} in {time.time()-t0:.2f}s")
-        return train.reset_index(drop=True), valid.reset_index(drop=True), test.reset_index(drop=True)
+
+        # 返回形式兼容旧代码
+        if use_calib:
+            return (train.reset_index(drop=True),
+                    calib.reset_index(drop=True),
+                    valid.reset_index(drop=True),
+                    test.reset_index(drop=True))
+        else:
+            return (train.reset_index(drop=True),
+                    valid.reset_index(drop=True),
+                    test.reset_index(drop=True))
+
+    
+    # ---- kfold ----
+    def kfold_ids_for_oof(self, n_splits: int = 5, random_state: int = 42,
+                          ensure_entity_coverage: bool = True,
+                          support_policy: str = 'allow_support',
+                          min_bucket: int = 5,
+                          verbose: bool = True):
+        """
+        Stratified K-fold by r_id for OOF.
+        - Only edge-level split; no entity split.
+        - If ensure_entity_coverage=True, each fold's TRAIN will cover all entities.
+        For degree-1 entities that would be missing, we mark their unique edges as
+        'support' (added into train AND removed from test) when support_policy='allow_support'.
+        Returns: list of dicts with keys: 'train', 'test', 'support' (all ID-level DataFrames).
+        """
+        assert n_splits >= 2
+        assert support_policy in {'allow_support', 'move_min'}
+
+        df = self._df_ids
+        # --- group by relation id for stratification ---
+        groups = df.groupby('r_id', sort=False).indices  # dict[rid] -> np.ndarray row indices
+        rng = np.random.default_rng(random_state)
+
+        # --- per-rid shuffle & split into K almost-equal chunks ---
+        # store per-rid list of index-chunks
+        per_rid_chunks = {}
+        for rid, idx in groups.items():
+            idx = np.asarray(idx, dtype=np.int64)
+            n = idx.size
+            if n < min_bucket:
+                # small buckets: put all into a single training pool by distributing minimally
+                # but still create K chunks (some empty)
+                rng.shuffle(idx)
+                chunks = [idx[i::n_splits] for i in range(n_splits)]  # round-robin
+            else:
+                rng.shuffle(idx)
+                # split into K contiguous chunks
+                splits = np.linspace(0, n, n_splits + 1, dtype=int)
+                chunks = [idx[splits[i]:splits[i+1]] for i in range(n_splits)]
+            per_rid_chunks[rid] = chunks
+
+        # --- build K folds' TEST index sets (disjoint) ---
+        fold_test_indices = []
+        for k in range(n_splits):
+            parts = [per_rid_chunks[rid][k] for rid in per_rid_chunks]
+            if len(parts):
+                fold_test_indices.append(np.concatenate(parts))
+            else:
+                fold_test_indices.append(np.empty(0, dtype=np.int64))
+
+        # --- assemble folds, add coverage cleanup if requested ---
+        folds = []
+        all_idx = np.arange(len(df), dtype=np.int64)
+        for k in range(n_splits):
+            test_ix = fold_test_indices[k]
+            # TRAIN = all - TEST
+            train_ix = np.setdiff1d(all_idx, test_ix, assume_unique=False)
+
+            train = df.iloc[train_ix].copy()
+            test  = df.iloc[test_ix].copy()
+            support = pd.DataFrame(columns=df.columns).astype(df.dtypes.to_dict())
+
+            if ensure_entity_coverage and len(test):
+                # seen entities in train
+                seen = np.zeros(self.num_e, dtype=bool)
+                seen[train['h_id'].to_numpy()] = True
+                seen[train['t_id'].to_numpy()] = True
+
+                # locate rows in TEST that touch unseen entities
+                t_h = test['h_id'].to_numpy(); t_t = test['t_id'].to_numpy()
+                need = (~seen[t_h]) | (~seen[t_t])
+                if need.any():
+                    need_rows = test.loc[need]
+                    if support_policy == 'allow_support':
+                        # promote to support: add to train; remove from test
+                        support = need_rows.copy()
+                        train = pd.concat([train, need_rows], ignore_index=True)
+                        test = test.loc[~need].reset_index(drop=True)
+                    else:
+                        # 'move_min'：与 allow_support 行为等价于把 need_rows 移到 train；
+                        # 为清晰起见也按同样处理
+                        train = pd.concat([train, need_rows], ignore_index=True)
+                        test = test.loc[~need].reset_index(drop=True)
+
+            folds.append({
+                'train': train.reset_index(drop=True),
+                'test':  test.reset_index(drop=True),
+                'support': support.reset_index(drop=True),
+            })
+
+            if verbose:
+                print(f"[kfold {k+1}/{n_splits}] train={len(folds[-1]['train'])} "
+                    f"test={len(folds[-1]['test'])} support={len(folds[-1]['support'])}")
+
+        return folds
+
 
 
 # -----------------------------
