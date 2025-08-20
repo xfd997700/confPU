@@ -10,9 +10,11 @@ model.py — NoisyPUDA (pair-wise Noisy-PU loss, PUDA-style training)
 1) 两步式循环与 pred = cat([pred_real, pred_fake]) 再喂 PUR（G: 取负；D: 取正）  —— 见 PUDA 训练主循环与 pur_loss 用法
 2) get_gen_neg(flag='gen'/'dis')：G-step 不让判别器图参与反传；D-step 不让生成器图参与反传 —— 见 PUDA.get_gen_neg
 3) 判别器在 D-step 叠加 L2 正则 —— 见 PUDA.DistMult 返回 l2_reg 并加入 loss_dis
+
+【注】本版本按当前方案：D-step 不把伪负并入 U；G-step 额外加入“feature matching”正则以对齐生成向量分布到真实实体流形；PU 风险支持可选样本级 τ（默认退化为常量 1-η，与原式一致）。
 """
 
-from typing import Tuple
+from typing import Tuple, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -23,8 +25,8 @@ import torchmetrics.retrieval as rt
 # =============================
 # 常量（关系先验）
 # =============================
-DEFAULT_PI = 1e-5   # P(y=1)
-DEFAULT_ETA = 0.0   # 噪声率
+DEFAULT_PI = 1e-4   # P(y=1)
+DEFAULT_ETA = 5e-4   # 噪声率
 
 
 # =============================
@@ -115,13 +117,13 @@ class NoiseGenerator(nn.Module):
 
 
 # =============================
-# 带噪 PU 风险（支持 pair-wise U 部分 & 自对抗权重）
+# 带噪 PU 风险（支持 pair-wise U 部分 & 自对抗权重 & 可选样本级 τ）
 # =============================
 class NoisyNNPULoss(nn.Module):
     """
     输入:
     - s_pos: [B]（正例 logits）
-    - s_unl: [B, U]（未标注 logits：数据负 + 伪负）
+    - s_unl: [B, U]（未标注 logits）
     - pi, eta: 可为 [B]（按关系）或标量
     形式：pi(1-eta)R_p^+ + [R_u^- - pi(1-eta)R_p^-]_+ + pi*eta*R_p^-
     surrogate 使用 logistic：softplus
@@ -130,6 +132,7 @@ class NoisyNNPULoss(nn.Module):
     - pairwise: True 时，把 U 风险按 pair-wise 计算：softplus(s_unl - s_pos)
                 False 时，按 point-wise 计算：softplus(s_unl)
     - self_adv: True 时，对 U 的每组样本用 softmax(alpha * score) 加权（自对抗加权）
+    - tau_pos:  样本级置信度 τ(x) ∈ [0,1]（只作用在三处 P 项）。若不传，则 τ≡(1-eta)，与原式完全一致。
     """
     def __init__(self, pairwise_default: bool = True, self_adv_default: bool = False, self_adv_alpha: float = 10.0):
         super().__init__()
@@ -139,7 +142,8 @@ class NoisyNNPULoss(nn.Module):
 
     def forward(self, s_pos: torch.Tensor, s_unl: torch.Tensor,
                 pi: torch.Tensor, eta: torch.Tensor,
-                pairwise: bool = None, self_adv: bool = None, self_adv_alpha: float = None) -> torch.Tensor:
+                pairwise: bool = None, self_adv: bool = None, self_adv_alpha: float = None,
+                tau_pos: Optional[Union[torch.Tensor, float]] = None) -> torch.Tensor:
         if s_unl.dim() == 1:
             s_unl = s_unl.view(s_pos.size(0), -1)
 
@@ -153,7 +157,6 @@ class NoisyNNPULoss(nn.Module):
 
         if pairwise:
             # U 风险按 pair-wise：对每个未标注与该组正例做 margin
-            # base = softplus(s_unl - s_pos)
             margin = s_unl - s_pos.view(-1, 1)
             base_uneg = F.softplus(margin)
             weight_scores = margin
@@ -168,9 +171,22 @@ class NoisyNNPULoss(nn.Module):
         else:
             l_uneg = base_uneg.mean(dim=1)
 
-        clean = pi * (1.0 - eta)                   # 干净正例比例
-        neg_risk = torch.clamp_min(l_uneg - clean * l_pneg, 0.0)
-        return (clean * l_pos + neg_risk + (pi * eta) * l_pneg).mean()
+        # ===== 样本级 τ(x)：只作用在三处 P 项；不传时退化为 τ=1-eta（与原式一致） =====
+        if tau_pos is None:
+            tau = 1.0 - eta
+        elif isinstance(tau_pos, float):
+            tau = torch.full_like(s_pos, float(tau_pos))
+        else:
+            # 传入张量时，允许 [B] 或 [B,1] 形状
+            tau = tau_pos.view(-1).to(s_pos.dtype)
+
+        # 三处 P 项
+        pos_term   = (pi * tau) * l_pos
+        deduct_pn  = (pi * tau) * l_pneg
+        noise_term = (pi * (1.0 - tau)) * l_pneg
+
+        neg_risk = torch.clamp_min(l_uneg - deduct_pn, 0.0)
+        return (pos_term + neg_risk + noise_term).mean()
 
 
 # =============================
@@ -194,7 +210,10 @@ class NoisyPUDA(pl.LightningModule):
                  self_adv_alpha: float = 10.0,
                  # === 新增：G 的目标/对抗强度 ===
                  g_obj: str = "linear",            # {"linear", "ns"}: 线性 -E[s_fake]；非饱和 softplus(-s_fake)
-                 beta_fake: float = 1.0):          # D-step 的额外“拉低伪负”权重：当不把伪负并入 U 时生效
+                 beta_fake: float = 1.0,           # D-step 的额外“拉低伪负”权重（未并入 U）
+                 # === 新增：Feature Matching 正则权重（G-step）===
+                 fm_gamma: float = 0.5,
+                 fm2_gamma: float = 0.0):
         super().__init__()
         self.save_hyperparameters(ignore=["bm"])
         self.bm = bm
@@ -204,7 +223,7 @@ class NoisyPUDA(pl.LightningModule):
         self.dis = KGEDistMult()
         self.gen = NoiseGenerator(emb_dim, dropout=gen_dropout)
 
-        # 带开关的带噪 PU 风险
+        # 带开关的带噪 PU 风险（支持样本级 τ）
         self.loss_fn = NoisyNNPULoss(pairwise_default=pairwise_u,
                                      self_adv_default=self_adv,
                                      self_adv_alpha=self_adv_alpha)
@@ -217,10 +236,7 @@ class NoisyPUDA(pl.LightningModule):
         self.gen_std = gen_std
 
         # === 控制开关 ===
-        # 是否采用对抗策略（False 时仅训练判别器 scoring，不进行 G-step）
         self.use_adversarial = bool(use_adversarial)
-
-        # U 风险与自对抗相关
         self.pairwise_u = bool(pairwise_u)
         self.self_adv = bool(self_adv)
         self.self_adv_alpha = float(self_adv_alpha)
@@ -229,6 +245,10 @@ class NoisyPUDA(pl.LightningModule):
         assert g_obj in {"linear", "ns"}
         self.g_obj = g_obj
         self.beta_fake = float(beta_fake)
+
+        # Feature Matching 正则
+        self.fm_gamma = float(fm_gamma)
+        self.fm2_gamma = float(fm2_gamma)
 
         self.automatic_optimization = False
 
@@ -343,22 +363,60 @@ class NoisyPUDA(pl.LightningModule):
         if self.use_adversarial:
             # 判别器前向（real/data-unlabeled）
             eh, er, et = self.emb(X)                    # [B*(1+K_data), D]
-            # 注意：G 的目标不再“同式异号” nnPU，而是“难负”目标
+            Ddim = eh.size(-1)
+
+            # 取每组正例的实体向量（作为真实参考用于 FM）
+            eh_g = self._view_group(eh, B, Ddim)[:, 0, :]   # [B,D]
+            et_g = self._view_group(et, B, Ddim)[:, 0, :]   # [B,D]
+
             r_ids = batch[:, 0, 1]                      # 正例的关系 id: [B]
-            h_gen, r_gen, t_gen = self._get_gen_neg(eh, er, et, bs=B, flag='gen', r_pos_ids=r_ids)
-            s_fake, _ = self.dis(h_gen, r_gen, t_gen)   # [B*2K]
-            # G 的两种目标：线性（最大化 s_fake）或非饱和（最小化 -log σ(s_fake)）
+            h_gen_all, r_gen_all, t_gen_all = self._get_gen_neg(eh, er, et, bs=B, flag='gen', r_pos_ids=r_ids)
+            s_fake, _ = self.dis(h_gen_all, r_gen_all, t_gen_all)   # [B*2K]
+
+            # —— G 的主目标：难负（线性 / 非饱和） ——
             if self.g_obj == "linear":
-                loss_g = - s_fake.mean()
+                loss_g_main = - s_fake.mean()
             else:  # "ns"
-                loss_g = F.softplus(-s_fake).mean()
+                loss_g_main = F.softplus(-s_fake).mean()
+
+            # —— Feature Matching 正则（只对齐一阶；可选二阶） ——
+            fm_loss = torch.tensor(0.0, device=X.device)
+            if self.fm_gamma > 0.0 or self.fm2_gamma > 0.0:
+                K = max(1, self.num_ng_gen // 2)
+                # 从拼接的输出中切分出“生成的 head/ tail”部分
+                gen_head = h_gen_all[B*K:, :]       # 后半段是生成的 head
+                gen_tail = t_gen_all[:B*K, :]       # 前半段是生成的 tail
+
+                mean_h_real = eh_g.mean(dim=0)
+                mean_t_real = et_g.mean(dim=0)
+                mean_h_gen  = gen_head.mean(dim=0)
+                mean_t_gen  = gen_tail.mean(dim=0)
+
+                fm1 = (mean_h_gen - mean_h_real).pow(2).mean() + (mean_t_gen - mean_t_real).pow(2).mean()
+                fm_loss = self.fm_gamma * fm1
+
+                if self.fm2_gamma > 0.0:
+                    m2_h_real = (eh_g * eh_g).mean(dim=0)
+                    m2_t_real = (et_g * et_g).mean(dim=0)
+                    m2_h_gen  = (gen_head * gen_head).mean(dim=0)
+                    m2_t_gen  = (gen_tail * gen_tail).mean(dim=0)
+                    fm2 = (m2_h_gen - m2_h_real).pow(2).mean() + (m2_t_gen - m2_t_real).pow(2).mean()
+                    fm_loss = fm_loss + self.fm2_gamma * fm2
+
+            loss_g = loss_g_main + fm_loss
+
             opt_g.zero_grad()
             self.manual_backward(loss_g)
             opt_g.step()
             self.untoggle_optimizer(opt_g)  # <== 关 G
         else:
             loss_g = torch.tensor(0.0, device=X.device)
+            loss_g_main = torch.tensor(0.0, device=X.device)
+            fm_loss = torch.tensor(0.0, device=X.device)
+
         self.log("loss_gen", loss_g, prog_bar=True, on_step=True, on_epoch=False)
+        self.log("loss_g_main", loss_g_main, prog_bar=False, on_step=True, on_epoch=False)
+        self.log("loss_fm", fm_loss, prog_bar=False, on_step=True, on_epoch=False)
 
         # ==========
         # Train D
@@ -382,11 +440,12 @@ class NoisyPUDA(pl.LightningModule):
 
         pi_b, eta_b = self._pi_eta_for_rel_ids(r_ids)
 
-        # —— D 的主损失：带噪 nnPU（可选 pair-wise U + 自对抗加权） ——
+        # —— D 的主损失：带噪 nnPU（可选 pair-wise U + 自对抗加权 + 可选 τ） ——
         loss_d = self.loss_fn(s_pos, s_unl, pi_b, eta_b,
-                              pairwise=self.pairwise_u, self_adv=self.self_adv, self_adv_alpha=self.self_adv_alpha)
+                              pairwise=self.pairwise_u, self_adv=self.self_adv, self_adv_alpha=self.self_adv_alpha,
+                              tau_pos=None)  # 第一步训练：τ 接口打通，但默认退化为 τ=1-eta
 
-        # —— 可选的“伪负拉低”额外项（仅在未并入 U 时启用） ——
+        # —— 可选的“伪负拉低”额外项（未并入 U 时启用） ——
         if s_fake_extra is not None and self.beta_fake > 0:
             loss_d = loss_d + self.beta_fake * F.softplus(s_fake_extra).mean()
 
@@ -425,11 +484,12 @@ class NoisyPUDA(pl.LightningModule):
         s_unl, _ = self.dis(eh_u, er_u, et_u)                    # [B*(C-1)]
         s_unl = s_unl.view(B, C - 1)
 
-        # 验证损失（Noisy-PU 风险；与训练保持同一开关设置）
+        # 验证损失（Noisy-PU 风险；与训练保持同一开关设置；τ 默认退化为 1-eta）
         r_ids = pos[:, 1]
         pi_b, eta_b = self._pi_eta_for_rel_ids(r_ids)
         val_loss = self.loss_fn(s_pos, s_unl, pi_b, eta_b,
-                                pairwise=self.pairwise_u, self_adv=self.self_adv, self_adv_alpha=self.self_adv_alpha)
+                                pairwise=self.pairwise_u, self_adv=self.self_adv, self_adv_alpha=self.self_adv_alpha,
+                                tau_pos=None)
         self._val_losses.append(val_loss.detach())
         # === 检索评估 ===
         # 不再额外前向 triples_all；直接用已算好的 s_pos/s_unl 拼完整候选得分
@@ -486,7 +546,8 @@ class NoisyPUDA(pl.LightningModule):
         r_ids = pos[:, 1]
         pi_b, eta_b = self._pi_eta_for_rel_ids(r_ids)
         test_loss = self.loss_fn(s_pos, s_unl, pi_b, eta_b,
-                                 pairwise=self.pairwise_u, self_adv=self.self_adv, self_adv_alpha=self.self_adv_alpha)
+                                 pairwise=self.pairwise_u, self_adv=self.self_adv, self_adv_alpha=self.self_adv_alpha,
+                                 tau_pos=None)
         self._test_losses.append(test_loss.detach())
 
         # 检索评估（CPU 上 update）

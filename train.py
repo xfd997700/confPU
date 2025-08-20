@@ -25,8 +25,8 @@ def parse_args():
     # ===== data / split =====
     p.add_argument("--dataset_path", type=str, default="dataset/dataset.pkl")
     p.add_argument("--relation_mode", type=str, default="simplified", choices=["simplified", "original"])
-    p.add_argument("--valid_size", type=float, default=0.01)
-    p.add_argument("--test_size", type=float, default=0.01)
+    p.add_argument("--valid_size", type=float, default=0.1)
+    p.add_argument("--test_size", type=float, default=0.1)
 
     p.add_argument("--min_bucket", type=int, default=5)
     p.add_argument("--seed", type=int, default=42)
@@ -38,18 +38,21 @@ def parse_args():
     p.add_argument("--eval_batch_size", type=int, default=1024, help="batch size for val/test")
     p.add_argument("--emb_dim", type=int, default=256)
     p.add_argument("--num_ng", type=int, default=8, help="negatives per pos in training dataset")
-    p.add_argument("--num_ng_eval", type=int, default=50, help="candidates per pos for validation/test")
+    p.add_argument("--num_ng_eval", type=int, default=32, help="candidates per pos for validation/test")
     p.add_argument("--num_ng_gen", type=int, default=8, help="generator negatives (model-side)")
     p.add_argument("--filtered", action="store_true", help="use filtered negative sampling in TRAIN (slower)")
-    p.add_argument("--lr_d", type=float, default=1e-4)
-    p.add_argument("--lr_g", type=float, default=1e-4)
+    p.add_argument("--lr_d", type=float, default=5e-4)
+    p.add_argument("--lr_g", type=float, default=5e-4)
     p.add_argument("--reg", type=float, default=0.0)
 
     # ===== model =====
-    p.add_argument("--use_adversarial", type=bool, default=True)
-    p.add_argument("--pairwise_u", type=bool, default=True)
-    p.add_argument("--self_adv", type=bool, default=True)
+    p.add_argument("--use_adversarial", type=bool, default=True, action="store_false")
+    p.add_argument("--pairwise_u", type=bool, default=True, action="store_false")
+    p.add_argument("--self_adv", type=bool, default=False, action="store_true")
     p.add_argument("--self_adv_alpha", type=float, default=10.0)
+    p.add_argument("--beta_fake", type=float, default=0.5)
+    p.add_argument("--fm_gamma", type=float, default=0.5)
+    p.add_argument("--g_obj", type=str, default='linear', options=['linear', 'ns'])
 
     # ===== trainer =====
     # p.add_argument("--max_steps", type=int, default=10000)
@@ -64,13 +67,13 @@ def parse_args():
 
     # ===== wandb =====
     p.add_argument("--wandb_project", type=str, default="NoisyPUDA")
-    p.add_argument("--wandb_run", type=str, default="debug")
+    p.add_argument("--wandb_run", type=str, default="tau+allignG")
     p.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"]) 
 
     # ===== checkpoint =====
-    p.add_argument("--checkpoint_dir", type=str, default="checkpoints")
-    p.add_argument("--monitor", type=str, default="val_loss")
-    p.add_argument("--monitor_mode", type=str, default="min", choices=["min", "max"])
+    p.add_argument("--checkpoint_root", type=str, default="checkpoints")
+    p.add_argument("--monitor", type=str, default="val_MRR")
+    p.add_argument("--monitor_mode", type=str, default="max", choices=["min", "max"])
     p.add_argument("--save_top_k", type=int, default=1, help="set 1 to keep only the best ckpt; -1 to save all")
     p.add_argument("--every_n_epochs", type=int, default=1)
     p.add_argument("--val_check_interval", type=float, default=0.5, help="float (0,1] for fraction of epoch")
@@ -80,6 +83,9 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+    args.checkpoint_dir = os.path.join(args.checkpoint_root, args.wandb_run)
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+
     pl.seed_everything(args.seed)
 
     # =========== Load dataset ===========
@@ -154,7 +160,10 @@ if __name__ == "__main__":
         use_adversarial=args.use_adversarial,
         pairwise_u=args.pairwise_u,
         self_adv=args.self_adv,
-        self_adv_alpha=args.self_adv_alpha
+        self_adv_alpha=args.self_adv_alpha,
+        g_obj=args.g_obj,
+        fm_gamma=args.fm_gamma,
+        beta_fake=args.beta_fake
     )
 
     # =========== Wandb Logger ===========
@@ -173,6 +182,12 @@ if __name__ == "__main__":
         "reg": args.reg,
         "seed": args.seed,
         "filtered_train": bool(args.filtered),
+        # ==== model setup ====
+        "self_adv": args.self_adv,
+        "self_adv_alpha": args.self_adv_alpha,
+        "g_obj": args.g_obj,
+        "fm_gamma": args.fm_gamma,
+        "beta_fake": args.beta_fake
     })
     wandb_logger.watch(model, log='all', log_freq=200)
 
