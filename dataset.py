@@ -55,7 +55,7 @@ class BucketManager:
                  force_rebuild: bool = False):
         assert {'htype','ttype','h','r','t'}.issubset(df_full.columns)
         relation_mode = relation_mode.lower(); assert relation_mode in {'original','simplified'}
-
+        self.df_full = df_full
         # ---- cache ----
         self._cache_path = None
         if cache_dir:

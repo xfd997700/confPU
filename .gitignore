@@ -1,9 +1,11 @@
 /PUDA.py
-/__pycache__
+*__pycache__
 /backup
 /checkpoints
 /dataset
 /lightning_logs
-/test.ipynb
 /wandb
 *.sh
+*.ipynb
+/clean_cache
+*.csv

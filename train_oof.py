@@ -44,8 +44,8 @@ def parse_args():
     p.add_argument("--num_ng_eval", type=int, default=32, help="candidates per pos for validation/test")
     p.add_argument("--num_ng_gen", type=int, default=8, help="generator negatives (model-side)")
     p.add_argument("--filtered", action="store_true", help="use filtered negative sampling in TRAIN (slower)")
-    p.add_argument("--lr_d", type=float, default=1e-3)
-    p.add_argument("--lr_g", type=float, default=1e-3)
+    p.add_argument("--lr_d", type=float, default=2e-3)
+    p.add_argument("--lr_g", type=float, default=2e-3)
     p.add_argument("--reg", type=float, default=0.5)
 
     # ===== model =====
@@ -59,7 +59,7 @@ def parse_args():
     p.add_argument("--g_obj", type=str, default='ns', choices=['linear', 'ns'])
 
     # ===== trainer =====
-    p.add_argument("--max_epochs", type=int, default=100)
+    p.add_argument("--max_epochs", type=int, default=30)
     p.add_argument("--limit_train_batches", type=float, default=1.0, help="float(0-1] or int")
     p.add_argument("--limit_val_batches", type=float, default=1.0, help="float(0-1] or int")
     p.add_argument("--limit_test_batches", type=float, default=1.0, help="float(0-1] or int")

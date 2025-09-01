@@ -41,16 +41,13 @@ def parse_args():
     p.add_argument("--num_ng_eval", type=int, default=32, help="candidates per pos for validation/test")
     p.add_argument("--num_ng_gen", type=int, default=8, help="generator negatives (model-side)")
     p.add_argument("--filtered", action="store_true", help="use filtered negative sampling in TRAIN (slower)")
-    p.add_argument("--lr_d", type=float, default=5e-4)
-    p.add_argument("--lr_g", type=float, default=5e-4)
-    p.add_argument("--reg", type=float, default=0.0)
+    p.add_argument("--lr_d", type=float, default=2e-3)
+    p.add_argument("--lr_g", type=float, default=2e-3)
+    p.add_argument("--reg", type=float, default=0.5)
 
     # ===== model =====
-    # p.add_argument("--use_adversarial", type=bool, default=True, action="store_false")
-    # p.add_argument("--pairwise_u", type=bool, default=True, action="store_false")
-    # p.add_argument("--self_adv", type=bool, default=False, action="store_true")
-    p.add_argument("--use_adversarial", default=True, action="store_false")
-    p.add_argument("--pairwise_u", default=True, action="store_false")
+    p.add_argument("--use_adversarial", default=False, action="store_true")
+    p.add_argument("--pairwise_u", default=False, action="store_true")
     p.add_argument("--self_adv", default=False, action="store_true")
 
     p.add_argument("--self_adv_alpha", type=float, default=10.0)
@@ -59,8 +56,7 @@ def parse_args():
     p.add_argument("--g_obj", type=str, default='ns', choices=['linear', 'ns'])
 
     # ===== trainer =====
-    # p.add_argument("--max_steps", type=int, default=10000)
-    p.add_argument("--max_epochs", type=int, default=100)  # 修改为max_epochs
+    p.add_argument("--max_epochs", type=int, default=30)  # 修改为max_epochs
     p.add_argument("--limit_train_batches", type=float, default=1.0, help="float(0-1] or int")
     p.add_argument("--limit_val_batches", type=float, default=1.0, help="float(0-1] or int; set small for quick dry-run")
     p.add_argument("--limit_test_batches", type=float, default=1.0, help="float(0-1] or int; set small for quick dry-run")

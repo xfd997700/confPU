@@ -26,8 +26,8 @@ import torchmetrics.retrieval as rt
 # 常量（关系先验）
 # =============================
 DEFAULT_PI = 1e-4   # P(y=1)
-DEFAULT_ETA = 5e-4   # 噪声率
-
+# DEFAULT_ETA = 2e-3   # 噪声率
+DEFAULT_ETA = 0   # 噪声率
 
 # =============================
 # 基础组件：FiLM + TypedEmbedding
@@ -345,6 +345,22 @@ class NoisyPUDA(pl.LightningModule):
         opt_g = torch.optim.Adam(self.gen.parameters(), lr=self.lr_g)
         return [opt_d, opt_g]
 
+    def forward(self, triples: torch.LongTensor) -> torch.Tensor:
+        """
+        接收 [N,3] 或 [B,C,3] 的三元组张量，返回对应 logits（一维展平）。
+        用于推理/评分；不返回正则项。
+        """
+        if triples.dim() == 3:
+            triples = triples.reshape(-1, triples.size(-1))  # [B*C,3]
+        eh, er, et = self.emb(triples)                       # [*,D]
+        scores, _ = self.dis(eh, er, et)                     # [*]
+        return scores.view(-1)
+
+    # 兼容你外面的 score_triples/forward_triples 调用习惯（可选）
+    @torch.no_grad()
+    def score_triples(self, triples: torch.LongTensor) -> torch.Tensor:
+        return self.forward(triples)
+    
     def training_step(self, batch: torch.Tensor, batch_idx: int):
         """
         PUDA-style 两步（完全对齐原版）：
@@ -478,11 +494,14 @@ class NoisyPUDA(pl.LightningModule):
         unl = batch[:, 1:, :].reshape(-1, 3) # [B*(C-1),3]
 
         # 判别器打分（一次前向；只用 logits）
-        eh, er, et = self.emb(pos)
-        s_pos, _ = self.dis(eh, er, et)                          # [B]
-        eh_u, er_u, et_u = self.emb(unl)
-        s_unl, _ = self.dis(eh_u, er_u, et_u)                    # [B*(C-1)]
-        s_unl = s_unl.view(B, C - 1)
+        # eh, er, et = self.emb(pos)
+        # s_pos, _ = self.dis(eh, er, et)                          # [B]
+        # eh_u, er_u, et_u = self.emb(unl)
+        # s_unl, _ = self.dis(eh_u, er_u, et_u)                    # [B*(C-1)]
+        # s_unl = s_unl.view(B, C - 1)
+
+        s_pos = self.forward(pos)                      # [B]
+        s_unl = self.forward(unl).view(B, C - 1)      # [B, C-1]
 
         # 验证损失（Noisy-PU 风险；与训练保持同一开关设置；τ 默认退化为 1-eta）
         r_ids = pos[:, 1]
@@ -537,11 +556,14 @@ class NoisyPUDA(pl.LightningModule):
         unl = batch[:, 1:, :].reshape(-1, 3)
 
         # 一次前向（与 valid 相同）
-        eh, er, et = self.emb(pos)
-        s_pos, _ = self.dis(eh, er, et)
-        eh_u, er_u, et_u = self.emb(unl)
-        s_unl, _ = self.dis(eh_u, er_u, et_u)
-        s_unl = s_unl.view(B, C - 1)
+        # eh, er, et = self.emb(pos)
+        # s_pos, _ = self.dis(eh, er, et)
+        # eh_u, er_u, et_u = self.emb(unl)
+        # s_unl, _ = self.dis(eh_u, er_u, et_u)
+        # s_unl = s_unl.view(B, C - 1)
+
+        s_pos = self.forward(pos)
+        s_unl = self.forward(unl).view(B, C - 1)
 
         r_ids = pos[:, 1]
         pi_b, eta_b = self._pi_eta_for_rel_ids(r_ids)
