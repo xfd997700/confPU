@@ -49,10 +49,10 @@ def parse_args():
     p.add_argument("--reg", type=float, default=0.5)
 
     # ===== model =====
-    p.add_argument("--use_adversarial", default=True, action="store_false")
-    p.add_argument("--pairwise_u", default=True, action="store_false")
+    p.add_argument("--use_adversarial", default=False, action="store_true")
+    p.add_argument("--pairwise_u", default=False, action="store_true")
     p.add_argument("--self_adv", default=False, action="store_true")
-
+    
     p.add_argument("--self_adv_alpha", type=float, default=10.0)
     p.add_argument("--beta_fake", type=float, default=0.5)
     p.add_argument("--fm_gamma", type=float, default=0.5)

@@ -8,4 +8,5 @@
 *.sh
 *.ipynb
 /clean_cache
+/screen_cache
 *.csv
