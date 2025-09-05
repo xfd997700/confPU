@@ -537,7 +537,7 @@ class CleanlabQuality:
 
         # 2) 准备 df_full 的 id 列（矢量化生成，不用 iterrows）
         # (a) type→id
-        df_full = self.bm.df_full[['htype','h','ttype','t','r']].copy()
+        df_full = self.bm.df_full.copy()
         df_full['htype_id'] = df_full['htype'].map(self.bm.type2id).astype('Int32')
         df_full['ttype_id'] = df_full['ttype'].map(self.bm.type2id).astype('Int32')
         df_full['r_id']     = df_full['r'].map(self.bm.rel2id).astype('Int32')  # simplify=True 时可忽略
@@ -582,3 +582,131 @@ class CleanlabQuality:
         # 扔掉htype_id ttype_id r_id h_id t_id oof_fold列
         out = out.drop(columns=['htype_id', 'ttype_id', 'r_id', 'h_id', 't_id', 'oof_fold'])
         return out
+
+
+def filter_predictions(
+    orig_path: str,
+    pred_path: str,
+    out_path: str,
+    consider_rel: bool = False,
+    chunksize: int = 1_000_000,
+    use_pair_only_cols: bool = True,
+):
+    """
+    从预测结果中过滤出原始 df 已存在的 (h,r,t) 或 (h,t)；结果写到 out_path (CSV)。
+    - consider_rel=True  使用 (h, r, t)（预测 r 去掉 'predict_' 再匹配）
+    - consider_rel=False 使用 (h, t)（或设 use_pair_only_cols=False 用 (htype,h,ttype,t)）
+    """
+    def _is_pickle(path: str) -> bool:
+        return str(path).lower().endswith((".pkl", ".pickle"))
+
+    def _read_iter(path: str, usecols=None, chunksize=1_000_000):
+        """按块读取 DataFrame：pickle 一次读，csv 分块生成器；统一为 str。"""
+        if _is_pickle(path):
+            df = pd.read_pickle(path)
+            if usecols is not None:
+                df = df[usecols]
+            # 统一成字符串，避免类型差异导致哈希不一致
+            for c in df.columns:
+                if df[c].dtype != object:
+                    df[c] = df[c].astype(str)
+            yield df
+        else:
+            for chunk in pd.read_csv(path, usecols=usecols, dtype=str, chunksize=chunksize):
+                yield chunk  # dtype=str 已经统一为 object/str
+
+    def _hash_keys(df: pd.DataFrame, cols) -> np.ndarray:
+        """64-bit 行哈希（返回 np.uint64）。"""
+        h = pd.util.hash_pandas_object(df[cols], index=False).values
+        return h.view(np.uint64)
+
+    # 1) 确定原始 df 用于建索引的列
+    if consider_rel:
+        orig_usecols = ['h', 'r', 't']
+        key_cols_orig = ['h', 'r', 't']
+    else:
+        if use_pair_only_cols:
+            orig_usecols = ['h', 't']
+            key_cols_orig = ['h', 't']
+        else:
+            orig_usecols = ['htype', 'h', 'ttype', 't']
+            key_cols_orig = ['htype', 'h', 'ttype', 't']
+
+    # 2) 探测预测 df 列（用于输出保持原样）
+    if _is_pickle(pred_path):
+        pred_cols = pd.read_pickle(pred_path).columns.tolist()
+    else:
+        # 这里修正：直接取 DataFrame，不用 next(...)
+        pred_cols = pd.read_csv(pred_path, nrows=0).columns.tolist()
+
+    # 预测端用于构键的列
+    if consider_rel:
+        pred_use_key_cols = ['h', 'r', 't']
+    else:
+        pred_use_key_cols = ['h', 't'] if use_pair_only_cols else ['htype', 'h', 'ttype', 't']
+
+    # 3) 建原始 df 的哈希索引（set[uint64]）
+    key_set = set()
+    n_rows_orig = 0
+    tqdm.write("[build] indexing original df ...")
+    for chunk in tqdm(_read_iter(orig_path, usecols=orig_usecols, chunksize=chunksize),
+                      desc="orig-index", unit="chunk"):
+        kh = _hash_keys(chunk, key_cols_orig)
+        key_set.update(kh.tolist())
+        n_rows_orig += len(chunk)
+    tqdm.write(f"[build] indexed {n_rows_orig:,} rows in original df")
+
+    # 4) 逐块读取预测 df，过滤并流式写出
+    out_dir = os.path.dirname(out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    # 先写表头
+    pd.DataFrame(columns=pred_cols).to_csv(out_path, index=False)
+
+    total_in = total_out = total_filtered = 0
+    tqdm.write("[filter] scanning predictions ...")
+    for chunk in tqdm(_read_iter(pred_path, usecols=None, chunksize=chunksize),
+                      desc="pred-filter", unit="chunk"):
+        # 只保证构键列为字符串（_read_iter 已基本统一）
+        for c in pred_use_key_cols:
+            if chunk[c].dtype != object:
+                chunk[c] = chunk[c].astype(str)
+
+        if consider_rel:
+            # r 去掉 'predict_' 再匹配
+            r_norm = chunk['r'].astype(str).str.replace(r'^predict_', '', regex=True)
+            key_df = pd.DataFrame({
+                'h': chunk['h'].astype(str),
+                'r': r_norm,
+                't': chunk['t'].astype(str),
+            })
+            kh = _hash_keys(key_df, ['h','r','t'])
+        else:
+            if use_pair_only_cols:
+                key_df = pd.DataFrame({
+                    'h': chunk['h'].astype(str),
+                    't': chunk['t'].astype(str),
+                })
+                kh = _hash_keys(key_df, ['h','t'])
+            else:
+                key_df = pd.DataFrame({
+                    'htype': chunk['htype'].astype(str),
+                    'h': chunk['h'].astype(str),
+                    'ttype': chunk['ttype'].astype(str),
+                    't': chunk['t'].astype(str),
+                })
+                kh = _hash_keys(key_df, ['htype','h','ttype','t'])
+
+        # set-membership 向量化：先转 list（避免逐元素 python 开销）
+        keys_list = kh.tolist()
+        mask_keep = ~np.fromiter((k in key_set for k in keys_list), count=len(keys_list), dtype=bool)
+
+        out_chunk = chunk.loc[mask_keep]
+        if len(out_chunk):
+            out_chunk.to_csv(out_path, mode="a", header=False, index=False)
+
+        total_in += len(chunk)
+        total_out += len(out_chunk)
+        total_filtered += int((~mask_keep).sum())
+
+    tqdm.write(f"[done] input={total_in:,}, kept={total_out:,}, removed={total_filtered:,}")

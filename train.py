@@ -55,6 +55,9 @@ def parse_args():
     p.add_argument("--fm_gamma", type=float, default=0.5)
     p.add_argument("--g_obj", type=str, default='ns', choices=['linear', 'ns'])
 
+    p.add_argument("--default_pi", type=float, default=1e-4, help="default prior P(y=1|r) if not in BM")
+    p.add_argument("--default_eta", type=float, default=2e-3, help="default noise rate P(s=1|y=0,r) if not in BM")
+
     # ===== trainer =====
     p.add_argument("--max_epochs", type=int, default=30)  # 修改为max_epochs
     p.add_argument("--limit_train_batches", type=float, default=1.0, help="float(0-1] or int")
@@ -163,7 +166,9 @@ if __name__ == "__main__":
         self_adv_alpha=args.self_adv_alpha,
         g_obj=args.g_obj,
         fm_gamma=args.fm_gamma,
-        beta_fake=args.beta_fake
+        beta_fake=args.beta_fake,
+        default_pi=args.default_pi,
+        default_eta=args.default_eta
     )
 
     # =========== Wandb Logger ===========

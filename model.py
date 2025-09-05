@@ -213,7 +213,11 @@ class NoisyPUDA(pl.LightningModule):
                  beta_fake: float = 1.0,           # D-step 的额外“拉低伪负”权重（未并入 U）
                  # === 新增：Feature Matching 正则权重（G-step）===
                  fm_gamma: float = 0.5,
-                 fm2_gamma: float = 0.0):
+                 fm2_gamma: float = 0.0,
+                 
+                 default_pi: float = DEFAULT_PI,
+                 default_eta: float = DEFAULT_ETA,
+                 ):
         super().__init__()
         self.save_hyperparameters(ignore=["bm"])
         self.bm = bm
@@ -252,6 +256,8 @@ class NoisyPUDA(pl.LightningModule):
 
         self.automatic_optimization = False
 
+        self.default_pi = float(default_pi)
+        self.default_eta = float(default_eta)
         # === Validation/Test 检索指标 ===
         self.top_k = (3, 10)
         self.val_metrics = nn.ModuleDict({
@@ -270,8 +276,8 @@ class NoisyPUDA(pl.LightningModule):
     def _pi_eta_for_rel_ids(self, r_ids: torch.LongTensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # 从 bm 取每个关系的先验（若不存在则回落到默认值）
         device = r_ids.device
-        pi = torch.full_like(r_ids, float(DEFAULT_PI), dtype=torch.float32, device=device)
-        eta = torch.full_like(r_ids, float(DEFAULT_ETA), dtype=torch.float32, device=device)
+        pi = torch.full_like(r_ids, float(self.default_pi), dtype=torch.float32, device=device)
+        eta = torch.full_like(r_ids, float(self.default_eta), dtype=torch.float32, device=device)
         if hasattr(self.bm, "pi"):
             for rid, val in self.bm.pi.items():
                 pi[r_ids == int(rid)] = float(val)

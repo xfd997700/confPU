@@ -31,7 +31,7 @@ R_CLIP = 50.0
 SUBSAMPLE_N = 2_000_000
 
 # 要评估的关系ID（可填 rid 或关系名）
-REL_FILTER = [0,1,2,3,4,12,13,14,16,15,16,17]
+REL_FILTER = [0,1,2,3,4,12,13,14,15,16,17]
 # REL_FILTER = [0,1]
 # {'compound:association:compound': 0,
 #  'compound:association:disease': 1,
