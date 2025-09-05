@@ -27,7 +27,7 @@ import torchmetrics.retrieval as rt
 # =============================
 DEFAULT_PI = 1e-4   # P(y=1)
 # DEFAULT_ETA = 2e-3   # 噪声率
-DEFAULT_ETA = 0   # 噪声率
+DEFAULT_ETA = 2e-3   # 噪声率
 
 # =============================
 # 基础组件：FiLM + TypedEmbedding
