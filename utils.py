@@ -540,7 +540,8 @@ class CleanlabQuality:
         df_full = self.bm.df_full.copy()
         df_full['htype_id'] = df_full['htype'].map(self.bm.type2id).astype('Int32')
         df_full['ttype_id'] = df_full['ttype'].map(self.bm.type2id).astype('Int32')
-        df_full['r_id']     = df_full['r'].map(self.bm.rel2id).astype('Int32')  # simplify=True 时可忽略
+        df_full['r_key'] = df_full['htype'].astype(str) + ':' + df_full['r'].astype(str) + ':' + df_full['ttype'].astype(str)
+        df_full['r_id'] = df_full['r_key'].map(self.bm.rel2id).astype('Int32')
 
         # (b) 构造实体映射表 ent_df： (type_id, name) -> gid
         ent_df = (

@@ -1,3 +1,4 @@
+# %%
 # ===== DEDPUL 版：端到端最小工作流（面向过程，轻量化） =====
 import os
 import time
@@ -17,10 +18,10 @@ warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
 # ---------------- 基本配置（与原示例保持一致的变量名） ----------------
 DATASET_PATH = "dataset/dataset.pkl"
-RELATION_MODE = "simplified"
+RELATION_MODE = "original"
 SIMPLIFY = RELATION_MODE == "simplified"
 CACHE_DIR = "dataset/cache"
-WANDB_RUN = "oof"
+WANDB_RUN = "oof_ori"
 CKPT_ROOT = "checkpoints"
 N_SPLITS = 5
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -31,7 +32,8 @@ R_CLIP = 50.0
 SUBSAMPLE_N = 2_000_000
 
 # 要评估的关系ID（可填 rid 或关系名）
-REL_FILTER = [0,1,2,3,4,12,13,14,15,16,17]
+REL_FILTER = [0,1,2,3,4,5,6,7,8,30,31,33,34,35,36,37]
+# REL_FILTER = [0,1,2,3,4,12,13,14,15,16,17]
 # REL_FILTER = [0,1]
 # {'compound:association:compound': 0,
 #  'compound:association:disease': 1,
@@ -73,6 +75,7 @@ bm = BucketManager(
     force_rebuild=False,
 )
 
+
 folds = bm.kfold_ids_for_oof(
     n_splits=N_SPLITS,
     random_state=42,
@@ -99,7 +102,7 @@ def parse_rel_filter_to_ids(bm, rel_filter):
 
 RID_KEEP = parse_rel_filter_to_ids(bm, REL_FILTER)
 print("RID_KEEP =", RID_KEEP)
-
+# %%
 # ---------------- 2. 加载所有折的模型 ----------------
 print("Loading models...")
 
@@ -207,6 +210,10 @@ with open(OUT_PARAM_PKL, "wb") as f:
     dill.dump(fold_par, f)
 print(f"[fit] saved params to {OUT_PARAM_PKL}")
 
+# %%
+
+with open(OUT_PARAM_PKL, "rb") as f:
+    fold_par = dill.load(f)
 # ---------------- 5. 执行 OOF 推断与质量评估 ----------------
 print("Running OOF inference and quality assessment...")
 
