@@ -17,11 +17,11 @@ import warnings
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
 # ---------------- 基本配置（与原示例保持一致的变量名） ----------------
-DATASET_PATH = "dataset/dataset.pkl"
+DATASET_PATH = "dataset/dataset_refine.pkl"
 RELATION_MODE = "original"
 SIMPLIFY = RELATION_MODE == "simplified"
 CACHE_DIR = "dataset/cache"
-WANDB_RUN = "oof_ori"
+WANDB_RUN = "oof_2nd"
 CKPT_ROOT = "checkpoints"
 N_SPLITS = 5
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -238,7 +238,7 @@ print(f"[Quality] saved to {RESULT_QUALITY_CSV}")
 # ---------------- 6. 简单统计 ----------------
 print("\n=== Results Summary ===")
 evaluated_samples = quality_df['conf_score'].notna().sum()
-print(f"Total samples evaluated: {evaluated_samples:,}")
+print(f"Total samples evaluated: {evaluated_samples}")
 
 if evaluated_samples > 0:
     print(f"Mean confidence score: {quality_df['conf_score'].mean():.4f}")

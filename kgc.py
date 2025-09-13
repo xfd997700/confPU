@@ -404,7 +404,7 @@ if __name__ == "__main__":
     # screen
     p.add_argument("--rid", type=str, nargs="+", required=False, help="relation ids or keys, comma/file allowed")
     p.add_argument("--out_csv", type=str, default="screen_cache/screen.csv")
-    p.add_argument("--filter_csv", type=str, default="screen_cache/filter.csv")
+    p.add_argument("--filter_csv", type=str, default="screen_cache/unibiomap.pred.csv")
     p.add_argument("--prob_thresh", type=float, default=0.9)
     p.add_argument("--axis", type=str, default="head", choices=["head","tail"])
     p.add_argument("--h_chunk", type=int, default=4096)
