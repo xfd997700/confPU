@@ -140,82 +140,90 @@ def collect_scores_and_fit(
     return par
 
 # ------------------------------
-# 内部工具：GEMM Top-K 候选召回（不改模型/数据结构）
+# 内部工具：GEMM Top-K 候选召回（双向）
 # ------------------------------
 @torch.no_grad()
 def recall_topk_by_gemm(
     model: NoisyPUDA,
     bm: BucketManager,
     rid: int,
-    heads: torch.LongTensor,      # [H] cpu
-    t_start: int, t_end: int,     # tail 子域全范围（闭开）
+    anchors: torch.LongTensor,     # [A] cpu；当 axis='head' 时是 heads；axis='tail' 时是 tails
+    search_start: int, search_end: int,  # 搜索另一端子域（闭开）
+    axis: str = "head",            # 'head'：固定 head 搜 tail；'tail'：固定 tail 搜 head
     topk: int = 1024,
     tile: int = 16384,
     device: str = "cuda",
     pbar: Optional[tqdm] = None,
-) -> Tuple[torch.LongTensor, torch.LongTensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    返回： (topk_vals, topk_tids)
-      - topk_vals: [H, K]  召回分数（DistMult 近似，q@T^T）
-      - topk_tids: [H, K]  每个 head 的 Top-K tail 全局 id
+    返回： (topk_vals, topk_ids)
+      - topk_vals: [A, K]
+      - topk_ids : [A, K]  每个 anchor 的 Top-K 另一端全局 id
     """
+    assert axis in ("head", "tail")
     device_t = torch.device(device)
     emb_e = model.emb.emb_e.weight.to(device_t)  # [N,D]
     emb_r = model.emb.emb_r.weight.to(device_t)  # [R,D]
-    # 关系类型
-    ht, tt = int(model.emb.rel_head_type[rid].item()), int(model.emb.rel_tail_type[rid].item())
 
-    # 关系向量 & 类型常量
-    er = emb_r[rid]                                 # [D]
-    th_ids = torch.full((heads.numel(),), ht, dtype=torch.long, device=device_t)
-    # 取 head 向量并做 FiLM + Hadamard(e_r)
-    eh = emb_e[heads.to(device_t)]                  # [H,D]
-    qh = model.emb.film(eh, th_ids) * er            # [H,D]
+    ht, tt = int(model.emb.rel_head_type[rid].item()), int(model.emb.rel_tail_type[rid].item())
+    er = emb_r[rid]  # [D]
+
+    # 根据方向确定：anchor 的类型 id、查询向量 q，和被检索端的 FiLM 类型
+    if axis == "head":
+        # anchors 是 heads，检索 tails
+        a_type = ht
+        b_type = tt
+        a_vec = emb_e[anchors.to(device_t)]                           # [A,D]
+        a_type_ids = torch.full((a_vec.size(0),), a_type, dtype=torch.long, device=device_t)
+        q = model.emb.film(a_vec, a_type_ids) * er                    # [A,D]
+    else:
+        # anchors 是 tails，检索 heads
+        a_type = tt
+        b_type = ht
+        a_vec = emb_e[anchors.to(device_t)]                           # [A,D]
+        a_type_ids = torch.full((a_vec.size(0),), a_type, dtype=torch.long, device=device_t)
+        q = model.emb.film(a_vec, a_type_ids) * er                    # [A,D]
 
     # 初始化 Top-K 容器
-    H = qh.size(0); K = int(topk)
+    A = q.size(0); K = int(topk)
     neg_inf = torch.tensor(-1e30, device=device_t)
-    best_vals = neg_inf.expand(H, K).clone()
-    best_tids = torch.zeros((H, K), dtype=torch.long, device=device_t)
+    best_vals = neg_inf.expand(A, K).clone()
+    best_ids = torch.zeros((A, K), dtype=torch.long, device=device_t)
 
-    # 遍历 tail tiles
-    total_tiles = math.ceil((t_end - t_start) / tile)
+    # 遍历被检索端 tiles
+    total_tiles = math.ceil((search_end - search_start) / tile)
     if pbar is None:
-        pbar_local = tqdm(total=total_tiles, desc="recall (tiles)", leave=False)
+        pbar_local = tqdm(total=total_tiles, desc=f"recall({axis}) tiles", leave=False)
     else:
         pbar_local = pbar
         pbar_local.reset(total=total_tiles)
 
-    for tb in range(t_start, t_end, tile):
-        te = min(tb + tile, t_end)
-        tids = torch.arange(tb, te, dtype=torch.long, device=device_t)   # [Tt]
-        et = emb_e[tids]                                                 # [Tt,D]
-        tt_ids = torch.full((et.size(0),), tt, dtype=torch.long, device=device_t)
-        et_film = model.emb.film(et, tt_ids)                             # [Tt,D]
+    for tb in range(search_start, search_end, tile):
+        te = min(tb + tile, search_end)
+        ids = torch.arange(tb, te, dtype=torch.long, device=device_t)   # [T]
+        b_vec = emb_e[ids]                                              # [T,D]
+        b_type_ids = torch.full((b_vec.size(0),), b_type, dtype=torch.long, device=device_t)
+        b_film = model.emb.film(b_vec, b_type_ids)                      # [T,D]
 
-        # GEMM： [H,D] @ [D,Tt] -> [H,Tt]
-        scores = torch.matmul(qh, et_film.t())                           # [H,Tt]
-
-        # 先对当前 tile 行内取 Top-K
+        scores = torch.matmul(q, b_film.t())                            # [A,T]
         cur_vals, cur_idx = torch.topk(scores, k=min(K, scores.size(1)), dim=1)
-        cur_tids = tids[cur_idx]                                         # [H,K]
+        cur_ids = ids[cur_idx]                                          # [A,K]
 
-        # 与历史 best 合并再取 Top-K
-        all_vals = torch.cat([best_vals, cur_vals], dim=1)               # [H, 2K]
-        all_tids = torch.cat([best_tids, cur_tids], dim=1)               # [H, 2K]
+        all_vals = torch.cat([best_vals, cur_vals], dim=1)              # [A,2K]
+        all_ids = torch.cat([best_ids, cur_ids], dim=1)                 # [A,2K]
         new_vals, new_pos = torch.topk(all_vals, k=K, dim=1)
-        new_tids = torch.gather(all_tids, 1, new_pos)
+        new_ids = torch.gather(all_ids, 1, new_pos)
 
-        best_vals, best_tids = new_vals, new_tids
+        best_vals, best_ids = new_vals, new_ids
         pbar_local.update(1)
 
     if pbar is None:
         pbar_local.close()
-    return best_vals, best_tids  # both on device
-
+    return best_vals, best_ids  # both on device
 
 # ------------------------------
 # 第二步：全图筛查（Top-K 召回 → 精排校准）
+#   现在支持 axis ∈ {head, tail, both}
 # ------------------------------
 def screen_all_pairs(
     bm: BucketManager,
@@ -225,11 +233,11 @@ def screen_all_pairs(
     out_csv: str,
     device: str = "cuda",
     prob_thresh: float = 0.8,
-    axis: str = "head",            # 仍按 head→tail 跑；tail 向同理可做
+    axis: str = "head",            # 'head' | 'tail' | 'both'
     h_chunk: int = 2048,
     t_chunk: int = 16384,          # 用作召回 tile
     eval_batch_size: int = 131072,
-    topk: int = 1024,              # 每个 head 召回的候选数
+    topk: int = 1024,              # 每个 anchor 召回的候选数
     recall_backend: str = "gemm",  # 预留 'faiss'；当前实现 'gemm'
     flush_every: int = 200_000,    # 命中缓冲写盘阈值
 ):
@@ -256,7 +264,127 @@ def screen_all_pairs(
         key = id2rel[int(rid)]                # 'htype:rel:ttype'
         rel_mid = key.split(':', 2)[1]        # 中间那段就是 rel
         return f"predict_{rel_mid}".upper()
-    
+
+    def _screen_one_direction(rid: int, direction: str):
+        """direction ∈ {'head','tail'}"""
+        sc = sc_dict.get(int(rid), None)
+        if sc is None:
+            tqdm.write(f"[warn] rid={rid}: no ScoreConf (skipped)")
+            return
+
+        # 关系类型范围
+        htid, ttid = bm.rel_types[int(rid)]
+        h_start, h_end = int(bm.offsets[htid].item()), int(bm.offsets[htid + 1].item())
+        t_start, t_end = int(bm.offsets[ttid].item()), int(bm.offsets[ttid + 1].item())
+        num_h = h_end - h_start; num_t = t_end - t_start
+        tqdm.write(f"[screen/{direction}] rid={rid}  head[{h_start},{h_end}) x tail[{t_start},{t_end})  -> {num_h} x {num_t}")
+
+        htype_str = id2type[int(htid)]
+        ttype_str = id2type[int(ttid)]
+        r_str = rid_to_predict_r(int(rid))
+
+        # 选择外层块循环与搜索域
+        if direction == "head":
+            outer_total = math.ceil(num_h / h_chunk)
+            anchor_range = (h_start, h_end)
+            search_range = (t_start, t_end)
+            anchor_chunk = h_chunk
+            outer_desc = f"rid {rid} head-chunks"
+        else:
+            outer_total = math.ceil(num_t / h_chunk)  # 复用 h_chunk 作为外层块尺寸，避免新增参数
+            anchor_range = (t_start, t_end)
+            search_range = (h_start, h_end)
+            anchor_chunk = h_chunk
+            outer_desc = f"rid {rid} tail-chunks"
+
+        with tqdm(total=outer_total, desc=outer_desc, leave=False) as pbar_outer:
+            hit_buffer = []
+            buffer_rows = 0
+
+            for a_beg in range(anchor_range[0], anchor_range[1], anchor_chunk):
+                a_end_blk = min(a_beg + anchor_chunk, anchor_range[1])
+                anchors = torch.arange(a_beg, a_end_blk, dtype=torch.long, device="cpu")
+                A_blk = anchors.numel()
+                if A_blk == 0:
+                    pbar_outer.update(1)
+                    continue
+
+                # 召回
+                if recall_backend != "gemm":
+                    raise NotImplementedError("Only 'gemm' recall is implemented currently.")
+                with tqdm(total=math.ceil((search_range[1] - search_range[0]) / t_chunk),
+                          desc=f"rid {rid} recall({direction})", leave=False) as pbar_recall:
+                    topk_vals, topk_ids = recall_topk_by_gemm(
+                        model, bm, int(rid),
+                        anchors=anchors,
+                        search_start=search_range[0], search_end=search_range[1],
+                        axis=direction,
+                        topk=int(topk), tile=int(t_chunk),
+                        device=device, pbar=pbar_recall
+                    )  # [A_blk, K] (device)
+
+                # 精排
+                A, K = topk_ids.size()
+                if direction == "head":
+                    flat_h = anchors.to(device_t).unsqueeze(1).expand(-1, K).reshape(-1)     # [A*K]
+                    flat_t = topk_ids.reshape(-1)                                            # [A*K]
+                else:
+                    flat_t = anchors.to(device_t).unsqueeze(1).expand(-1, K).reshape(-1)
+                    flat_h = topk_ids.reshape(-1)
+
+                flat_r = torch.full_like(flat_h, int(rid))
+                triples_all = torch.stack([flat_h, flat_r.to(device_t), flat_t], dim=1)
+
+                with tqdm(total=math.ceil(triples_all.size(0) / eval_batch_size),
+                          desc=f"rid {rid} rerank({direction})", leave=False) as pbar_rerank:
+                    for i in range(0, triples_all.size(0), eval_batch_size):
+                        j = min(i + eval_batch_size, triples_all.size(0))
+                        triples = triples_all[i:j]
+                        with torch.no_grad():
+                            logits = model.score_triples(triples).detach().cpu().numpy()
+                        probs = sc.logits_to_prob(logits, mode="U")
+
+                        mask = probs >= float(prob_thresh)
+                        if np.any(mask):
+                            sel_h = flat_h[i:j].detach().cpu().numpy()[mask].astype(np.int64)
+                            sel_t = flat_t[i:j].detach().cpu().numpy()[mask].astype(np.int64)
+                            sel_score = logits[mask].astype(np.float32)
+                            sel_conf  = probs[mask].astype(np.float32)
+
+                            h_names = [gid_to_name(int(g), htid) for g in sel_h]
+                            t_names = [gid_to_name(int(g), ttid) for g in sel_t]
+
+                            kept = pd.DataFrame({
+                                "htype": [htype_str] * len(h_names),
+                                "ttype": [ttype_str] * len(t_names),
+                                "h": h_names,
+                                "r": [r_str] * len(h_names),
+                                "t": t_names,
+                                "score": sel_score,
+                                "conf": sel_conf,
+                            })
+                            hit_buffer.append(kept)
+                            buffer_rows += kept.shape[0]
+
+                            if buffer_rows >= int(flush_every):
+                                pd.concat(hit_buffer, ignore_index=True).to_csv(out_csv, mode="a", header=False, index=False)
+                                tqdm.write(f"[rid {rid} / {direction}] flushed {buffer_rows} rows")
+                                hit_buffer.clear()
+                                buffer_rows = 0
+
+                        pbar_rerank.update(1)
+
+                # 清理 GPU 中间张量
+                del topk_vals, topk_ids, flat_h, flat_t, flat_r, triples_all
+                torch.cuda.empty_cache()
+                pbar_outer.update(1)
+
+            # 残余缓冲写盘
+            if buffer_rows > 0 and len(hit_buffer) > 0:
+                pd.concat(hit_buffer, ignore_index=True).to_csv(out_csv, mode="a", header=False, index=False)
+                tqdm.write(f"[rid {rid} / {direction}] final flush {buffer_rows} rows")
+                hit_buffer.clear()
+
     # CSV 头
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
     header_needed = not os.path.exists(out_csv)
@@ -266,113 +394,15 @@ def screen_all_pairs(
     # 第 0 层：逐关系
     with tqdm(total=len(rid_list), desc="relations") as pbar_rel:
         for rid in rid_list:
-            sc = sc_dict.get(int(rid), None)
-            if sc is None:
-                tqdm.write(f"[warn] rid={rid}: no ScoreConf (skipped)")
-                pbar_rel.update(1)
-                continue
-
-            # 关系类型范围（r -> (head_type, tail_type)）
-            htid, ttid = bm.rel_types[int(rid)]                                   # 
-            h_start, h_end = int(bm.offsets[htid].item()), int(bm.offsets[htid + 1].item())
-            t_start, t_end = int(bm.offsets[ttid].item()), int(bm.offsets[ttid + 1].item())
-            num_h = h_end - h_start; num_t = t_end - t_start
-            tqdm.write(f"[screen] rid={rid}  head[{h_start},{h_end}) x tail[{t_start},{t_end})  -> {num_h} x {num_t}")
-
-            htype_str = id2type[int(htid)]                                        # 
-            ttype_str = id2type[int(ttid)]
-            r_str = rid_to_predict_r(int(rid))
-
-            # 第 1 层：head-chunks
-            outer_total = math.ceil(num_h / h_chunk)
-            with tqdm(total=outer_total, desc=f"rid {rid} head-chunks", leave=False) as pbar_outer:
-                hit_buffer = []
-                buffer_rows = 0
-
-                for h_beg in range(h_start, h_end, h_chunk):
-                    h_end_blk = min(h_beg + h_chunk, h_end)
-                    heads = torch.arange(h_beg, h_end_blk, dtype=torch.long, device="cpu")
-                    H_blk = heads.numel()
-                    if H_blk == 0:
-                        pbar_outer.update(1)
-                        continue
-
-                    # 第 2 层：召回（tail tiles 覆盖整个 tail 类型域）
-                    if recall_backend != "gemm":
-                        raise NotImplementedError("Only 'gemm' recall is implemented currently.")
-                    with tqdm(total=math.ceil(num_t / t_chunk), desc=f"rid {rid} recall", leave=False) as pbar_recall:
-                        topk_vals, topk_tids = recall_topk_by_gemm(
-                            model, bm, int(rid),
-                            heads=heads,
-                            t_start=t_start, t_end=t_end,
-                            topk=int(topk), tile=int(t_chunk),
-                            device=device, pbar=pbar_recall
-                        )  # [H_blk, K] (device)
-
-                    # 第 3 层：精排批次（对 H_blk×topk 评分并映射回字符串）
-                    H, K = topk_tids.size()
-                    flat_h = heads.to(device_t).unsqueeze(1).expand(-1, K).reshape(-1)      # [H*K]
-                    flat_t = topk_tids.reshape(-1)                                          # [H*K]
-                    flat_r = torch.full_like(flat_h, int(rid))                              # [H*K]
-                    triples_all = torch.stack([flat_h, flat_r.to(device_t), flat_t], dim=1)
-
-                    with tqdm(total=math.ceil(triples_all.size(0) / eval_batch_size),
-                              desc=f"rid {rid} rerank(batches)", leave=False) as pbar_rerank:
-                        for i in range(0, triples_all.size(0), eval_batch_size):
-                            j = min(i + eval_batch_size, triples_all.size(0))
-                            triples = triples_all[i:j]
-                            with torch.no_grad():
-                                logits = model.score_triples(triples).detach().cpu().numpy()
-                            probs = sc.logits_to_prob(logits, mode="U")
-
-                            mask = probs >= float(prob_thresh)
-                            if np.any(mask):
-                                # 取出命中对的 h/t 全局ID
-                                sel_h = flat_h[i:j].detach().cpu().numpy()[mask].astype(np.int64)
-                                sel_t = flat_t[i:j].detach().cpu().numpy()[mask].astype(np.int64)
-                                sel_score = logits[mask].astype(np.float32)
-                                sel_conf  = probs[mask].astype(np.float32)
-
-                                # ==== ID -> 文本映射（df_full 风格）====
-                                # 已知 htid/ttid，不需要回扫类型；直接按 offsets 计算局部 id
-                                h_names = [gid_to_name(int(g), htid) for g in sel_h]         # 反查实体名（head）
-                                t_names = [gid_to_name(int(g), ttid) for g in sel_t]         # 反查实体名（tail）
-
-                                kept = pd.DataFrame({
-                                    "htype": [htype_str] * len(h_names),
-                                    "ttype": [ttype_str] * len(t_names),
-                                    "h": h_names,
-                                    "r": [r_str] * len(h_names),
-                                    "t": t_names,
-                                    "score": sel_score,
-                                    "conf": sel_conf,
-                                })
-                                hit_buffer.append(kept)
-                                buffer_rows += kept.shape[0]
-
-                                if buffer_rows >= int(flush_every):
-                                    pd.concat(hit_buffer, ignore_index=True).to_csv(out_csv, mode="a", header=False, index=False)
-                                    tqdm.write(f"[rid {rid}] flushed {buffer_rows} rows")
-                                    hit_buffer.clear()
-                                    buffer_rows = 0
-
-                            pbar_rerank.update(1)
-
-                    # 清理 GPU 中间张量
-                    del topk_vals, topk_tids, flat_h, flat_t, flat_r, triples_all
-                    torch.cuda.empty_cache()
-                    pbar_outer.update(1)
-
-                # 残余缓冲写盘
-                if buffer_rows > 0 and len(hit_buffer) > 0:
-                    pd.concat(hit_buffer, ignore_index=True).to_csv(out_csv, mode="a", header=False, index=False)
-                    tqdm.write(f"[rid {rid}] final flush {buffer_rows} rows")
-                    hit_buffer.clear()
-
+            # 单向或双向执行
+            if axis == "both":
+                _screen_one_direction(rid, "head")
+                _screen_one_direction(rid, "tail")
+            else:
+                _screen_one_direction(rid, axis)
             pbar_rel.update(1)
 
     print(f"[done] screening finished. results -> {out_csv}")
-
 
 # ------------------------------
 # CLI
@@ -406,7 +436,7 @@ if __name__ == "__main__":
     p.add_argument("--out_csv", type=str, default="screen_cache/screen.csv")
     p.add_argument("--filter_csv", type=str, default="screen_cache/unibiomap.pred.csv")
     p.add_argument("--prob_thresh", type=float, default=0.9)
-    p.add_argument("--axis", type=str, default="head", choices=["head","tail"])
+    p.add_argument("--axis", type=str, default="both", choices=["head","tail","both"])  # 支持 both
     p.add_argument("--h_chunk", type=int, default=4096)
     p.add_argument("--t_chunk", type=int, default=16384)           # 用作召回 tile
     p.add_argument("--eval_batch_size", type=int, default=2_097_152)
