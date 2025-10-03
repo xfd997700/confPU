@@ -10,3 +10,6 @@
 /clean_cache
 /screen_cache
 *.csv
+test.py
+test2.py
+*.pkl

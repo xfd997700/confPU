@@ -88,7 +88,9 @@ def export_embeddings(
         'num_entities': num_entities,
         'emb_dim': emb_dim,
         'entity_offsets': bm.offsets.cpu(),
-        'type_names': [bm.id2type[i] for i in range(bm.num_t)]
+        'type_names': [bm.id2type[i] for i in range(bm.num_t)],
+        'type_local_ents': bm.type_local_ents,  # 原始实体名称列表
+        'id2type': bm.id2type,                  # 类型ID到名称映射
     }
     
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
