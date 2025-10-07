@@ -240,6 +240,7 @@ def screen_all_pairs(
     topk: int = 1024,              # 每个 anchor 召回的候选数
     recall_backend: str = "gemm",  # 预留 'faiss'；当前实现 'gemm'
     flush_every: int = 200_000,    # 命中缓冲写盘阈值
+    clear_csv: bool = True,  # 新增参数：是否清空已存在的CSV
 ):
     assert os.path.exists(par_path), f"Not found: {par_path}"
     with open(par_path, "rb") as f:
@@ -247,6 +248,13 @@ def screen_all_pairs(
 
     device_t = torch.device(device)
     model = load_model_from_ckpt(ckpt_path, bm, device=device)
+
+    # 清空CSV文件（如果存在且需要清空）
+    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+    if clear_csv and os.path.exists(out_csv):
+        print(f"[init] Clearing existing CSV file: {out_csv}")
+        # 删除旧文件
+        os.remove(out_csv)
 
     # ==== 映射工具（从 ID 还原成 df_full 风格）====
     offsets = bm.offsets.cpu().numpy()                       # [num_t+1]
@@ -443,6 +451,8 @@ if __name__ == "__main__":
     p.add_argument("--topk", type=int, default=1024)
     p.add_argument("--recall_backend", type=str, default="gemm", choices=["gemm"])
     p.add_argument("--flush_every", type=int, default=200_000)
+    p.add_argument("--no_clear_csv", action="store_true", help="prevent clearing existing CSV files")  # 新增
+
 
     # device
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -500,6 +510,7 @@ if __name__ == "__main__":
             topk=args.topk,
             recall_backend=args.recall_backend,
             flush_every=args.flush_every,
+            clear_csv=not args.no_clear_csv,  # 默认清空，除非指定 --no_clear_csv
         )
 
     # ========== Step 3: filter (optional) ==========

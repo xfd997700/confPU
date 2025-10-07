@@ -537,7 +537,7 @@ class CleanlabQuality:
 
         # 2) 准备 df_full 的 id 列（矢量化生成，不用 iterrows）
         # (a) type→id
-        df_full = self.bm.df_full.copy()
+        df_full = self.bm.df_full.copy()[['htype','ttype','h','r','t','src']]
         df_full['htype_id'] = df_full['htype'].map(self.bm.type2id).astype('Int32')
         df_full['ttype_id'] = df_full['ttype'].map(self.bm.type2id).astype('Int32')
         df_full['r_key'] = df_full['htype'].astype(str) + ':' + df_full['r'].astype(str) + ':' + df_full['ttype'].astype(str)
@@ -581,7 +581,7 @@ class CleanlabQuality:
         out = out.drop(columns=[c for c in out.columns if c not in set(df_full.columns) | {'prob','cl_score','fold'}])
         out = out.rename(columns={'prob':'conf_prob', 'cl_score':'conf_score', 'fold':'oof_fold'})
         # 扔掉htype_id ttype_id r_id h_id t_id oof_fold列
-        out = out.drop(columns=['htype_id', 'ttype_id', 'r_id', 'h_id', 't_id', 'oof_fold'])
+        out = out.drop(columns=['htype_id', 'ttype_id', 'r_id', 'h_id', 't_id', 'oof_fold', 'r_key'])
         return out
 
 
