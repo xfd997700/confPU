@@ -1,0 +1,16 @@
+bitarray==3.7.2
+catboost==1.2.8
+cleanlab==2.7.1
+cvxopt==1.3.2
+dgl==2.4.0+cu124
+dill==0.4.0
+matplotlib==3.10.7
+networkx==3.3
+numpy==2.3.4
+pandas==2.3.3
+pytorch_lightning==2.5.1
+scikit_learn==1.7.2
+scipy==1.16.2
+torch==2.4.0+cu124
+torchmetrics==1.7.1
+tqdm==4.67.1
